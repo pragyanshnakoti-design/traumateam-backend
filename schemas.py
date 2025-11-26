@@ -1,12 +1,22 @@
 from pydantic import BaseModel
 from typing import Optional, List
 
+# ---------- AUTH ----------
 class RequestOtp(BaseModel):
     email: str
 
 class VerifyOtp(BaseModel):
     email: str
     otp: str
+
+# For auth.py compatibility
+class OTPVerify(BaseModel):
+    email: str
+    otp: str
+
+class UserCreate(BaseModel):
+    email: str
+    full_name: Optional[str] = None
 
 class CredLogin(BaseModel):
     user_id: str
@@ -21,6 +31,8 @@ class TokenResponse(BaseModel):
     access_token: str
     user: TokenUser
 
+
+# ---------- APPOINTMENTS ----------
 class AppointmentCreate(BaseModel):
     patient_name: str
     email: Optional[str] = None
@@ -41,8 +53,8 @@ class AppointmentOut(BaseModel):
     status: str
     created_at: str
 
-# 🔥 THIS WAS MISSING
+
+# ---------- ADMIN ----------
 class AdminLogin(BaseModel):
     username: str
     password: str
-
