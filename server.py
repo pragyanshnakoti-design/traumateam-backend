@@ -1,4 +1,4 @@
-# server.py - SECURE BACKEND FOR TRAUMA TEAM
+# server.py - SECURE BACKEND FOR TRAUMA TEAM (PATCHED FOR PYDANTIC 2.x)
 
 import os
 import random
@@ -21,13 +21,12 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 load_dotenv()
 
 def _env(key: str, default=None):
-    """Safely load environment variables and strip quotes"""
     v = os.getenv(key, default)
     if v is None:
         return default
     return v.strip().replace('"', '').replace("'", "")
 
-# Configuration
+# Config
 RESEND_API_KEY = _env("RESEND_API_KEY")
 RESEND_FROM = _env("RESEND_FROM", "onboarding@resend.dev")
 ADMIN_USER = _env("ADMIN_USER", "admin")
@@ -37,28 +36,26 @@ DATABASE_URL = _env("DATABASE_URL", "sqlite:///./trauma_team.db")
 OTP_EXPIRE_MINUTES = int(_env("OTP_EXPIRE_MINUTES", "5"))
 CORS_ORIGINS = _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:8080")
 
-# Rate limiting configuration
+# Rate limit
 RATE_LIMIT_PER_MINUTE = 10
 request_counts = {}
 
-# Resend setup
+# Resend
 EMAIL_ENABLED = False
 if RESEND_API_KEY:
     try:
         import resend
         resend.api_key = RESEND_API_KEY
         EMAIL_ENABLED = True
-        print("✅ Email service enabled (Resend)")
+        print("✅ Email service enabled")
     except Exception as e:
-        print(f"⚠️  Email service disabled: {e}")
+        print("⚠️ Resend error:", e)
 else:
-    print("⚠️  RESEND_API_KEY not set - emails will be logged to console")
+    print("⚠️ Email disabled (No API key)")
 
 def _send_email(to: str, subject: str, html: str):
-    """Send email via Resend or log to console"""
-    # Sanitize email content
     html = html.replace("<script", "&lt;script").replace("</script", "&lt;/script")
-    
+
     if EMAIL_ENABLED:
         try:
             import resend
@@ -68,18 +65,19 @@ def _send_email(to: str, subject: str, html: str):
                 "subject": subject,
                 "html": html
             })
-            print(f"✅ Email sent to {to}: {subject}")
+            print(f"📧 Email sent to {to}")
         except Exception as e:
-            print(f"❌ Email error: {e}")
+            print("❌ Email error:", e)
     else:
-        print(f"📧 [EMAIL SIMULATION] To: {to}, Subject: {subject}")
+        print(f"[EMAIL SIMULATION] To: {to} -- {subject}")
 
-# --- Database setup ---
+# Database
 engine = create_engine(
-    DATABASE_URL, 
+    DATABASE_URL,
     connect_args={"check_same_thread": False},
     pool_pre_ping=True
 )
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
@@ -90,33 +88,33 @@ def get_db():
     finally:
         db.close()
 
-# --- Database Models ---
+# MODELS
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
-    username = Column(String(100), nullable=False)
-    password = Column(String(255), nullable=False)
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True)
+    username = Column(String(100))
+    password = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class OTP(Base):
     __tablename__ = "otp"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), index=True, nullable=False)
-    otp = Column(String(10), nullable=False)
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255))
+    otp = Column(String(10))
     created_at = Column(DateTime, default=datetime.utcnow)
     attempts = Column(Integer, default=0)
 
 class Booking(Base):
     __tablename__ = "bookings"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=True, index=True)  # Link to user if authenticated
-    invoice_id = Column(String(50), unique=True, index=True)
-    patient_name = Column(String(200), nullable=False)
-    email = Column(String(255), nullable=False)
-    doctor = Column(String(100), nullable=False)
-    appointment_date = Column(String(20), nullable=False)
-    appointment_time = Column(String(10), nullable=False)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=True)
+    invoice_id = Column(String(50), unique=True)
+    patient_name = Column(String(200))
+    email = Column(String(255))
+    doctor = Column(String(100))
+    appointment_date = Column(String(20))
+    appointment_time = Column(String(10))
     message = Column(Text)
     status = Column(String(20), default="PENDING")
     payment_status = Column(String(20), default="pending")
@@ -125,41 +123,40 @@ class Booking(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
-    id = Column(Integer, primary_key=True, index=True)
-    payment_id = Column(String(50), unique=True, index=True)
-    booking_id = Column(Integer, index=True)
-    user_id = Column(Integer, nullable=True, index=True)
+    id = Column(Integer, primary_key=True)
+    payment_id = Column(String(50), unique=True)
+    booking_id = Column(Integer)
+    user_id = Column(Integer, nullable=True)
     amount = Column(Float)
     card_number_last4 = Column(String(4))
     card_name = Column(String(200))
     status = Column(String(20), default="completed")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create all tables
 Base.metadata.create_all(bind=engine)
+# --- Rate limiting middleware & helpers ---
+from fastapi import Response
 
-# --- Security Middleware ---
 def rate_limit_check(request: Request):
-    """Simple rate limiting"""
-    client_ip = request.client.host
-    current_minute = datetime.now().strftime("%Y-%m-%d-%H-%M")
+    client_ip = request.client.host if request.client else "unknown"
+    current_minute = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
     key = f"{client_ip}:{current_minute}"
-    
-    if key not in request_counts:
-        request_counts[key] = 0
-    
+
+    # initialize counter
+    request_counts.setdefault(key, 0)
     request_counts[key] += 1
-    
+
     if request_counts[key] > RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(
-            status_code=429, 
-            detail="Too many requests. Please try again later."
-        )
-    
-    # Cleanup old entries
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
+    # cleanup older keys (keep tiny memory)
     for k in list(request_counts.keys()):
-        if k.split(":")[1] != current_minute:
-            del request_counts[k]
+        # key format IP:YYYY-MM-DD-HH-MM
+        try:
+            if k.split(":")[1] != current_minute:
+                del request_counts[k]
+        except Exception:
+            pass
 
 # --- Auth helpers ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
@@ -173,82 +170,59 @@ def create_token(data: dict, hours_valid: int = 8):
 def decode_token(token: str):
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
+    except Exception:
         return None
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Authentication required"
-        )
-    
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     payload = decode_token(token)
     if not payload or "user_id" not in payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Invalid or expired token"
-        )
-    
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
     user = db.query(User).filter(User.id == payload["user_id"]).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="User not found"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
 
 def get_optional_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    """Get user if authenticated, None otherwise"""
     if not token:
         return None
-    
     payload = decode_token(token)
     if not payload or "user_id" not in payload:
         return None
-    
     return db.query(User).filter(User.id == payload["user_id"]).first()
 
 def require_admin(token: str = Depends(oauth2_scheme)):
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Admin access required"
-        )
-    
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     payload = decode_token(token)
     if not payload or not payload.get("is_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Admin access required"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return payload
 
-# --- Input Validation Schemas ---
+# --- Input validation schemas (Pydantic 2.x compatible) ---
 class OTPRequest(BaseModel):
     email: EmailStr
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    otp: str = Field(..., min_length=4, max_length=4, regex="^[0-9]{4}$")
+    otp: str = Field(..., min_length=4, max_length=4, pattern=r"^[0-9]{4}$")
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=8, max_length=100)
-    
-    @validator('username')
+
+    @validator("username")
     def validate_username(cls, v):
-        if not re.match("^[a-zA-Z0-9_]+$", v):
+        if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("Username can only contain letters, numbers, and underscores")
         return v
-    
-    @validator('password')
+
+    @validator("password")
     def validate_password(cls, v):
-        if not re.search("[A-Z]", v):
+        if not re.search(r"[A-Z]", v):
             raise ValueError("Password must contain at least one uppercase letter")
-        if not re.search("[a-z]", v):
+        if not re.search(r"[a-z]", v):
             raise ValueError("Password must contain at least one lowercase letter")
-        if not re.search("[0-9]", v):
+        if not re.search(r"[0-9]", v):
             raise ValueError("Password must contain at least one digit")
         return v
 
@@ -260,38 +234,38 @@ class BookingCreate(BaseModel):
     patient_name: str = Field(..., min_length=2, max_length=200)
     email: EmailStr
     doctor: str = Field(..., min_length=1, max_length=100)
-    appointment_date: str = Field(..., regex="^\d{4}-\d{2}-\d{2}$")
-    appointment_time: str = Field(..., regex="^\d{2}:\d{2}$")
+    appointment_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    appointment_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
     message: Optional[str] = Field(None, max_length=1000)
-    
-    @validator('doctor')
+
+    @validator("doctor")
     def validate_doctor(cls, v):
         allowed_doctors = ["Dr. R. Sharma", "Dr. M. Gupta", "Dr. Jyoti"]
         if v not in allowed_doctors:
             raise ValueError("Invalid doctor selection")
         return v
-    
-    @validator('appointment_date')
+
+    @validator("appointment_date")
     def validate_date(cls, v):
         try:
             date = datetime.strptime(v, "%Y-%m-%d").date()
-            if date < datetime.now().date():
+            if date < datetime.utcnow().date():
                 raise ValueError("Appointment date cannot be in the past")
-            if date > datetime.now().date() + timedelta(days=90):
+            if date > datetime.utcnow().date() + timedelta(days=90):
                 raise ValueError("Appointment date too far in future")
-        except ValueError as e:
+        except Exception as e:
             raise ValueError(f"Invalid date: {str(e)}")
         return v
 
 class PaymentCreate(BaseModel):
     booking_id: int = Field(..., gt=0)
     card_number: str = Field(..., min_length=13, max_length=19)
-    expiry_date: str = Field(..., regex="^\d{2}/\d{2}$")
-    cvv: str = Field(..., min_length=3, max_length=4, regex="^[0-9]{3,4}$")
+    expiry_date: str = Field(..., pattern=r"^\d{2}/\d{2}$")
+    cvv: str = Field(..., min_length=3, max_length=4, pattern=r"^[0-9]{3,4}$")
     card_name: str = Field(..., min_length=2, max_length=200)
     amount: float = Field(..., gt=0, le=100000)
-    
-    @validator('card_number')
+
+    @validator("card_number")
     def validate_card(cls, v):
         clean = v.replace(" ", "").replace("-", "")
         if not clean.isdigit():
@@ -299,17 +273,17 @@ class PaymentCreate(BaseModel):
         if len(clean) not in [13, 15, 16, 19]:
             raise ValueError("Invalid card number length")
         return clean
-    
-    @validator('expiry_date')
+
+    @validator("expiry_date")
     def validate_expiry(cls, v):
         try:
-            month, year = map(int, v.split('/'))
+            month, year = map(int, v.split("/"))
             if month < 1 or month > 12:
                 raise ValueError("Invalid month")
             exp_date = datetime(2000 + year, month, 1)
-            if exp_date < datetime.now():
+            if exp_date < datetime.utcnow():
                 raise ValueError("Card has expired")
-        except:
+        except Exception:
             raise ValueError("Invalid expiry date format")
         return v
 
@@ -318,154 +292,118 @@ class ConsultationConfirm(BaseModel):
 
 # --- Utility functions ---
 def generate_invoice_id():
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    random_num = random.randint(1000, 9999)
-    return f"TT-{timestamp}-{random_num}"
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    rnd = random.randint(1000, 9999)
+    return f"TT-{ts}-{rnd}"
 
 def generate_payment_id():
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    random_num = random.randint(10000, 99999)
-    return f"PAY-{timestamp}-{random_num}"
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    rnd = random.randint(10000, 99999)
+    return f"PAY-{ts}-{rnd}"
 
-def sanitize_html(text: str) -> str:
-    """Basic XSS prevention"""
-    if not text:
+def sanitize_html(text: Optional[str]) -> Optional[str]:
+    if text is None:
         return text
     return (text.replace("<", "&lt;")
                 .replace(">", "&gt;")
                 .replace('"', "&quot;")
                 .replace("'", "&#x27;"))
 
-# --- FastAPI app ---
-app = FastAPI(
-    title="Trauma Team International API",
-    docs_url=None,  # Disable in production
-    redoc_url=None  # Disable in production
-)
+# --- FastAPI app and CORS ---
+app = FastAPI(title="Trauma Team International API (patched)")
 
-# CORS - Strict configuration
-allowed_origins = [o.strip() for o in CORS_ORIGINS.split(",")]
+allowed_origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=allowed_origins or ["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["Content-Type", "Authorization"],
     max_age=3600
 )
 
-# --- Root endpoint ---
+# --- Root ---
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "service": "Trauma Team International API",
-        "version": "2.0-secure"
-    }
+    return {"status": "ok", "service": "Trauma Team International API", "version": "2.0-secure-patched"}
 
 # --- OTP endpoints ---
 @app.post("/otp/request")
 def otp_request(payload: OTPRequest, request: Request, db: Session = Depends(get_db)):
     rate_limit_check(request)
-    
-    code = f"{random.randint(1000, 9999)}"
-    
-    # Delete old OTPs
+
+    # generate 4-digit OTP
+    code = f"{random.randint(1000, 9999):04d}"
+
+    # remove existing OTPs for email
     db.query(OTP).filter(OTP.email == payload.email).delete()
-    
-    record = OTP(email=payload.email, otp=code, created_at=datetime.utcnow())
-    db.add(record)
+
+    rec = OTP(email=payload.email, otp=code, created_at=datetime.utcnow(), attempts=0)
+    db.add(rec)
     db.commit()
-    
+
     html = f"""
     <h2>Your TraumaTeam OTP</h2>
     <p>Your verification code is <strong>{code}</strong>.</p>
     <p>It will expire in {OTP_EXPIRE_MINUTES} minutes.</p>
-    <p>If you did not request this code, please ignore this email.</p>
     """
+
     _send_email(payload.email, "TraumaTeam OTP Code", html)
-    
     return {"message": "OTP sent"}
 
 @app.post("/register")
 def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     rate_limit_check(request)
-    
-    # Verify OTP
-    rec = db.query(OTP).filter(
-        OTP.email == payload.email, 
-        OTP.otp == payload.otp
-    ).first()
-    
+
+    rec = db.query(OTP).filter(OTP.email == payload.email, OTP.otp == payload.otp).first()
     if not rec:
         raise HTTPException(status_code=400, detail="Invalid OTP")
-    
     if datetime.utcnow() - rec.created_at > timedelta(minutes=OTP_EXPIRE_MINUTES):
         db.delete(rec)
         db.commit()
         raise HTTPException(status_code=400, detail="OTP expired")
-    
-    # Check if user exists
+
+    # ensure not already registered
     if db.query(User).filter(User.email == payload.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create user
+
     hashed = bcrypt.hash(payload.password)
-    user = User(
-        email=payload.email, 
-        username=sanitize_html(payload.username), 
-        password=hashed
-    )
+    user = User(email=payload.email, username=sanitize_html(payload.username), password=hashed)
     db.add(user)
     db.delete(rec)
     db.commit()
     db.refresh(user)
-    
+
     token = create_token({"user_id": user.id})
-    
-    _send_email(
-        user.email,
-        "Welcome to TraumaTeam",
-        f"<p>Hi {sanitize_html(user.username)}, your account has been created successfully!</p>"
-    )
-    
-    return {
-        "message": "Registered successfully",
-        "token": token,
-        "user_id": user.id,
-        "username": user.username
-    }
+    _send_email(user.email, "Welcome to TraumaTeam", f"<p>Hi {sanitize_html(user.username)}, your account is ready.</p>")
+
+    return {"message": "Registered successfully", "token": token, "user_id": user.id, "username": user.username}
 
 @app.post("/login")
 def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
     rate_limit_check(request)
-    
+
     user = db.query(User).filter(User.email == payload.email).first()
-    
     if not user or not bcrypt.verify(payload.password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    token = create_token({"user_id": user.id})
-    
-    return {
-        "token": token,
-        "user_id": user.id,
-        "username": user.username
-    }
 
-# --- BOOKING ENDPOINTS ---
+    token = create_token({"user_id": user.id})
+    return {"token": token, "user_id": user.id, "username": user.username}
+# ---------------------------------------------------------
+# BOOKING ENDPOINTS
+# ---------------------------------------------------------
 @app.post("/bookings/")
 def create_booking(
-    booking: BookingCreate, 
+    booking: BookingCreate,
     request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user)
 ):
     rate_limit_check(request)
-    
+
     try:
         invoice_id = generate_invoice_id()
-        
+
         new_booking = Booking(
             user_id=current_user.id if current_user else None,
             invoice_id=invoice_id,
@@ -478,24 +416,25 @@ def create_booking(
             status="PENDING",
             payment_status="pending"
         )
-        
+
         db.add(new_booking)
         db.commit()
         db.refresh(new_booking)
-        
+
+        # send confirmation email
         _send_email(
             booking.email,
-            "Booking Confirmation - Trauma Team International",
+            "Booking Received - Trauma Team International",
             f"""
             <h2>🏥 Booking Received!</h2>
-            <p>Dear {sanitize_html(booking.patient_name)},</p>
-            <p>Your consultation has been booked with <strong>{booking.doctor}</strong></p>
+            <p>Hello {sanitize_html(booking.patient_name)},</p>
+            <p>Your consultation with <strong>{booking.doctor}</strong> has been booked.</p>
             <p><strong>Invoice ID:</strong> {invoice_id}</p>
             <p><strong>Date:</strong> {booking.appointment_date}</p>
             <p><strong>Time:</strong> {booking.appointment_time}</p>
             """
         )
-        
+
         return {
             "id": new_booking.id,
             "invoice_id": invoice_id,
@@ -503,13 +442,18 @@ def create_booking(
             "doctor": new_booking.doctor,
             "appointment_date": new_booking.appointment_date,
             "appointment_time": new_booking.appointment_time,
-            "status": new_booking.status
+            "status": new_booking.status,
         }
-        
+
     except Exception as e:
+        print("Booking Error:", e)
         db.rollback()
         raise HTTPException(status_code=500, detail="Booking failed")
 
+
+# ---------------------------------------------------------
+# PAYMENT ENDPOINT
+# ---------------------------------------------------------
 @app.post("/payments/")
 def process_payment(
     payment: PaymentCreate,
@@ -518,59 +462,60 @@ def process_payment(
     current_user: Optional[User] = Depends(get_optional_user)
 ):
     rate_limit_check(request)
-    
+
+    booking = db.query(Booking).filter(Booking.id == payment.booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    # authorization
+    if current_user and booking.user_id and booking.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
     try:
-        # Find booking with authorization check
-        booking = db.query(Booking).filter(Booking.id == payment.booking_id).first()
-        
-        if not booking:
-            raise HTTPException(status_code=404, detail="Booking not found")
-        
-        # Authorization: Only booking owner (if authenticated) or email match can pay
-        if current_user and booking.user_id and booking.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Unauthorized")
-        
         payment_id = generate_payment_id()
-        
+
         new_payment = Payment(
             payment_id=payment_id,
             booking_id=payment.booking_id,
             user_id=current_user.id if current_user else None,
             amount=payment.amount,
-            card_number_last4=payment.card_number[-4:],
+            card_number_last4=payment.card_number[-4:],  # only last 4 digits
             card_name=sanitize_html(payment.card_name),
             status="completed"
         )
-        
+
         booking.payment_status = "paid"
         booking.status = "CONFIRMED"
-        
+
         db.add(new_payment)
         db.commit()
-        
+
         _send_email(
             booking.email,
-            "Payment Successful",
+            "Payment Successful - Trauma Team",
             f"""
-            <h2>✅ Payment Confirmed!</h2>
-            <p>Payment ID: {payment_id}</p>
+            <h2>💳 Payment Successful</h2>
+            <p>Payment ID: <strong>{payment_id}</strong></p>
             <p>Amount: ₹{payment.amount:,.2f}</p>
             """
         )
-        
+
         return {
             "status": "completed",
             "payment_id": payment_id,
             "booking_id": payment.booking_id,
-            "message": "Payment processed successfully"
+            "message": "Payment processed successfully",
         }
-        
-    except HTTPException:
-        raise
+
     except Exception as e:
+        print("Payment Error:", e)
         db.rollback()
         raise HTTPException(status_code=500, detail="Payment failed")
 
+
+# ---------------------------------------------------------
+# CONSULTATION CONFIRM
+# ---------------------------------------------------------
 @app.post("/consultation/confirm")
 def confirm_consultation(
     confirm: ConsultationConfirm,
@@ -579,95 +524,101 @@ def confirm_consultation(
     current_user: Optional[User] = Depends(get_optional_user)
 ):
     rate_limit_check(request)
-    
+
     booking = db.query(Booking).filter(Booking.id == confirm.booking_id).first()
-    
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-    
-    # Authorization check
+
     if current_user and booking.user_id and booking.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
-    
+
     if booking.payment_status != "paid":
         raise HTTPException(status_code=400, detail="Payment not completed")
-    
+
     booking.consultation_confirmed = True
     booking.status = "CONFIRMED"
     db.commit()
-    
+
     _send_email(
         booking.email,
         "Consultation Confirmed",
-        "<h2>🎉 Consultation Confirmed!</h2>"
+        "<h2>🎉 Your consultation is officially confirmed!</h2>"
     )
-    
+
     return {"status": "success", "message": "Consultation confirmed"}
 
+
+# ---------------------------------------------------------
+# USER APPOINTMENTS (AUTH REQUIRED)
+# ---------------------------------------------------------
 @app.get("/api/appointments")
 def get_user_appointments(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # REQUIRES AUTH NOW
+    current_user: User = Depends(get_current_user)
 ):
-    """Get appointments for authenticated user only"""
-    bookings = db.query(Booking).filter(
-        Booking.user_id == current_user.id
-    ).order_by(Booking.created_at.desc()).all()
-    
-    appointments = []
-    for booking in bookings:
-        appointments.append({
-            "id": booking.id,
-            "invoice_id": booking.invoice_id,
-            "doctor_name": booking.doctor,
-            "appointment_date": booking.appointment_date,
-            "appointment_time": booking.appointment_time,
-            "message": booking.message,
-            "status": booking.status,
-            "payment_status": booking.payment_status,
-            "consultation_confirmed": booking.consultation_confirmed,
-            "doctor_fee": 15000
-        })
-    
-    return {"appointments": appointments}
+    bookings = (
+        db.query(Booking)
+        .filter(Booking.user_id == current_user.id)
+        .order_by(Booking.created_at.desc())
+        .all()
+    )
 
-# --- ADMIN ENDPOINTS ---
+    output = []
+
+    for b in bookings:
+        output.append({
+            "id": b.id,
+            "invoice_id": b.invoice_id,
+            "doctor_name": b.doctor,
+            "appointment_date": b.appointment_date,
+            "appointment_time": b.appointment_time,
+            "message": b.message,
+            "status": b.status,
+            "payment_status": b.payment_status,
+            "consultation_confirmed": b.consultation_confirmed,
+        })
+
+    return {"appointments": output}
+
+
+# ---------------------------------------------------------
+# ADMIN ENDPOINTS
+# ---------------------------------------------------------
 @app.post("/admin/login")
 def admin_login(payload: LoginRequest, request: Request):
     rate_limit_check(request)
-    
+
     if payload.email != ADMIN_USER or payload.password != ADMIN_PASS:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
     token = create_token({"is_admin": True}, hours_valid=24)
     return {"token": token}
 
+
 @app.get("/admin/bookings")
-def admin_get_bookings(
-    _admin=Depends(require_admin), 
-    db: Session = Depends(get_db)
-):
+def admin_get_bookings(_admin=Depends(require_admin), db: Session = Depends(get_db)):
     bookings = db.query(Booking).order_by(Booking.created_at.desc()).all()
     return {"bookings": bookings}
 
+
 @app.get("/admin/payments")
-def admin_get_payments(
-    _admin=Depends(require_admin),
-    db: Session = Depends(get_db)
-):
+def admin_get_payments(_admin=Depends(require_admin), db: Session = Depends(get_db)):
     payments = db.query(Payment).order_by(Payment.created_at.desc()).all()
     return {"payments": payments}
 
+
+# ---------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+
+# ---------------------------------------------------------
+# RUN SERVER
+# ---------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 Starting Secure Trauma Team API...")
-    print(f"🔒 CORS: {allowed_origins}")
-    print(f"📧 Email: {'Enabled' if EMAIL_ENABLED else 'Console mode'}\n")
+    print("\n🚀 Starting Trauma Team API (Patched)")
     uvicorn.run(app, host="0.0.0.0", port=8000)
